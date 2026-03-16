@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+streamlit
+pdfplumber
+sentence-transformers
+faiss-cpu
+langchain
+langchain-text-splitters
+transformers
+requests
+pymongo
