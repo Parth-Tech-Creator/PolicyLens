@@ -4,6 +4,7 @@ import { Particles } from "./components/Particles";
 import { Landing } from "./pages/Landing";
 import { Auth } from "./pages/Auth";
 
+
 const API_BASE_URL: string =
   (typeof import.meta !== "undefined" && (import.meta as any).env?.VITE_POLICY_AI_API_BASE) ||
   "http://localhost:8000";
@@ -218,8 +219,34 @@ const ChatPanelView: React.FC<ChatPanelProps> = ({
 export const App: React.FC = () => {
   const [page, setPage] = useState<Page>("landing");
   const [authTab, setAuthTab] = useState<AuthTab>("login");
-  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [isLoggedIn, setIsLoggedIn] = useState(!!getCurrentUser());
   const [currentUser, setCurrentUser] = useState<StoredUser | null>(getCurrentUser);
+
+  useEffect(() => {
+  const params = new URLSearchParams(window.location.search);
+
+  const email = params.get("email");
+  const name = params.get("name");
+
+  if (email) {
+    const user = {
+      firstName: name || "User",
+      lastName: "",
+      email,
+      org: "",
+      password: ""
+    };
+
+    localStorage.setItem("policylens_current_user", JSON.stringify(user));
+
+    setIsLoggedIn(true);
+    setCurrentUser(user);
+
+    window.history.replaceState({}, document.title, "/");
+
+    setPage("app");
+  }
+}, []);
   const [sidebarView, setSidebarView] = useState<SidebarView>("new");
 
   const [step, setStep] = useState<Step>("upload");

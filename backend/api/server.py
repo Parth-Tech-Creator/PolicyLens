@@ -1,3 +1,16 @@
+import os
+from pathlib import Path
+from dotenv import load_dotenv
+from authlib.integrations.starlette_client import OAuth
+from fastapi.responses import RedirectResponse
+from fastapi import Request
+from starlette.middleware.sessions import SessionMiddleware
+
+env_path = Path(__file__).resolve().parent / ".env"
+load_dotenv(dotenv_path=env_path)
+
+
+
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -21,15 +34,37 @@ from backend.database.mongo_client import MongoClientWrapper
 app = FastAPI(title="Policy-AI API")
 
 app.add_middleware(
+    SessionMiddleware,
+    secret_key="super-secret-key"
+)
+
+oauth = OAuth()
+
+oauth.register(
+    name='google',
+    client_id=os.getenv("CLIENT_ID"),
+    client_secret=os.getenv("CLIENT_SECRET"),
+    server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
+    client_kwargs={'scope': 'openid email profile'}
+)
+
+# ── CORS ─────────────────────────────────────────────────────────────
+# Add your Vercel frontend URL here once deployed
+# e.g. "https://policylens.vercel.app"
+ALLOWED_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
+    "http://localhost:8501",
+    "http://127.0.0.1:8501",
+    # ↓ ADD YOUR VERCEL URL HERE when you deploy frontend
+    # "https://YOUR-APP-NAME.vercel.app",
+]
+
+app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:5174",
-        "http://127.0.0.1:5174",
-        "http://localhost:8501",
-        "http://127.0.0.1:8501",
-    ],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -116,9 +151,7 @@ async def upload_document(
         "chunks": chunks, "text": text,
     }
 
-    # 4. RED FLAG DETECTION — runs on every chunk
-    # Stage 1: fast regex scan across all chunks
-    # Stage 2: Llama writes a plain-English explanation for each hit
+    # 4. Red flag detection
     red_flags = detect_red_flags(chunks, llama_client, max_flags=12)
 
     # 5. Depth-calibrated summary
@@ -176,7 +209,7 @@ async def upload_document(
                 "summary_sentence": summary_sentence,
             })
 
-    # 8. MongoDB
+    # 8. Store in MongoDB
     mongo_client.store_document(
         filename=file.filename, summary=summary, chunks=chunks,
         metadata={"path": str(file_path), "depth": depth, "red_flag_count": len(red_flags)},
@@ -199,10 +232,10 @@ async def query_document(req: QueryRequest):
     if not session:
         raise HTTPException(status_code=404, detail=f"Document '{req.filename}' not in session. Re-upload first.")
 
-    embedder = session["embedder"]
+    embedder  = session["embedder"]
     retriever = session["retriever"]
     query_vec = embedder.get_embeddings([req.question])[0]
-    sources = retriever.get_relevant_context(query_vec, top_k=3)
+    sources   = retriever.get_relevant_context(query_vec, top_k=3)
     context_text = "\n\n---\n\n".join(src["text"] for src in sources)
 
     history_str = ""
@@ -219,6 +252,15 @@ async def query_document(req: QueryRequest):
         f"USER QUESTION: {req.question}\n\nANSWER:"
     )
     answer = llama_client.ask(prompt)
+
+    # Log query to MongoDB
+    mongo_client.log_query(
+        filename=req.filename,
+        question=req.question,
+        answer=answer.strip(),
+        sources=[src["text"][:200] for src in sources],
+    )
+
     return {
         "answer": answer.strip(),
         "sources": [{"index": src["index"], "text": src["text"]} for src in sources],
@@ -231,11 +273,11 @@ async def summarize_depth(req: SummarizeRequest):
     if not session:
         raise HTTPException(status_code=404, detail=f"Document '{req.filename}' not in session.")
 
-    text = session["text"]
-    embedder = session["embedder"]
+    text      = session["text"]
+    embedder  = session["embedder"]
     retriever = session["retriever"]
-    cfg = DEPTH_CONFIG.get(req.depth, DEPTH_CONFIG["Standard"])
-    summary = _build_depth_summary(text, req.depth)
+    cfg       = DEPTH_CONFIG.get(req.depth, DEPTH_CONFIG["Standard"])
+    summary   = _build_depth_summary(text, req.depth)
     summary_sentences = [s.strip() for s in summary.split(".") if len(s.strip()) > 20]
 
     summary_map = []
@@ -254,8 +296,39 @@ async def summarize_depth(req: SummarizeRequest):
 
 @app.get("/health")
 def health_check():
-    return {"status": "online", "sessions": list(_sessions.keys())}
+    return {
+        "status": "online",
+        "sessions": list(_sessions.keys()),
+        "mongodb": mongo_client.enabled,
+        "llm_model": llama_client.model,
+    }
+
+@app.get("/auth/google")
+async def login(request: Request):
+    redirect_uri = "http://127.0.0.1:8000/auth/google/callback"
+    return await oauth.google.authorize_redirect(request, redirect_uri)
 
 
+@app.get("/auth/google/callback")
+async def auth_callback(request: Request):
+    token = await oauth.google.authorize_access_token(request)
+    user = token.get("userinfo")
+
+    email = user.get("email")
+    name = user.get("name")
+
+    # Save in Mongo (optional but recommended)
+    try:
+        mongo_client.db.users.update_one(
+            {"email": email},
+            {"$set": {"email": email, "name": name}},
+            upsert=True
+        )
+    except:
+        pass
+
+    return RedirectResponse(
+        url=f"http://localhost:5173?email={email}&name={name}"
+    )
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
